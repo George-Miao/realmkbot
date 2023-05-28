@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use async_trait::async_trait;
 use color_eyre::Result;
 use rust_tdlib::{
@@ -40,8 +42,7 @@ pub async fn init(config: &Config) -> Result<(Client<TdJson>, WorkerHandle)> {
     let tdlib_params = TdlibParameters::builder()
         .database_directory(
             config
-                .data_dir
-                .join("tdlib")
+                .tdlib_dir()
                 .as_os_str()
                 .to_str()
                 .expect("Non-utf8 path"),
@@ -71,6 +72,7 @@ pub async fn init(config: &Config) -> Result<(Client<TdJson>, WorkerHandle)> {
     info!("TDLib logging in");
 
     let client = worker.bind_client(client).await?;
+    tokio::time::sleep(Duration::SECOND * 3).await;
 
     info!("TDLib logged in");
 

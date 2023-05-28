@@ -1,4 +1,4 @@
-#![feature(lazy_cell, type_changing_struct_update)]
+#![feature(lazy_cell, type_changing_struct_update, duration_constants)]
 
 #[macro_use]
 extern crate log;
@@ -68,6 +68,8 @@ impl App<()> {
 
 impl App<i64> {
     async fn run(&mut self) -> Result<()> {
+        info!("Running");
+
         loop {
             select! {
                 update = self.handle.next_update() => {
@@ -84,10 +86,6 @@ impl App<i64> {
         }
 
         info!("Shutting down");
-        self.client
-            .log_out(LogOut::builder().build())
-            .await
-            .expect("Failed to logout");
         Ok(())
     }
 
@@ -167,6 +165,7 @@ impl<ID> App<ID> {
         info!("Populating");
 
         let mut consecutive_empty_msg = 0;
+        let mut added = 0;
 
         for id in 1.. {
             if consecutive_empty_msg > 10 {
@@ -197,10 +196,11 @@ impl<ID> App<ID> {
 
             consecutive_empty_msg = 0;
             MessageRecord::from_raw(msg, id)?.pipe(|msg| self.db.insert_one(&msg))?;
+            added += 1;
             debug!("Added");
         }
 
-        info!("Done");
+        info!("Done, {added} message(s) added");
 
         Ok(())
     }
@@ -250,5 +250,9 @@ impl Config {
         });
 
         &CONFIG
+    }
+
+    pub fn tdlib_dir(&self) -> PathBuf {
+        self.data_dir.join("tdlib")
     }
 }
