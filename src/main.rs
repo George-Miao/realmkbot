@@ -82,6 +82,12 @@ impl App<i64> {
                 _ = ctrl_c() => { break }
             };
         }
+
+        info!("Shutting down");
+        self.client
+            .log_out(LogOut::builder().build())
+            .await
+            .expect("Failed to logout");
         Ok(())
     }
 
@@ -148,7 +154,13 @@ impl<ID> App<ID> {
             .await?
             .chat_id();
 
-        Ok(App { chat_id, ..self })
+        Ok(App {
+            chat_id,
+            config: self.config,
+            db: self.db,
+            client: self.client,
+            handle: self.handle,
+        })
     }
 
     async fn populate(&self) -> Result<()> {
@@ -187,6 +199,8 @@ impl<ID> App<ID> {
             MessageRecord::from_raw(msg, id)?.pipe(|msg| self.db.insert_one(&msg))?;
             debug!("Added");
         }
+
+        info!("Done");
 
         Ok(())
     }
