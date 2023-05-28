@@ -63,6 +63,11 @@ impl App<()> {
             chat_id: (),
             handle,
         };
+        this.client
+            .get_me(GetMe::builder().build())
+            .await?
+            .first_name()
+            .pipe(|x| info!("Logged in as @{x}"));
         this.populate().await?;
         Ok(this)
     }
@@ -164,6 +169,11 @@ impl<ID> App<ID> {
     }
 
     async fn populate(&self) -> Result<()> {
+        if self.config.skip_populate {
+            info!("Skipped populating");
+            return Ok(());
+        }
+
         info!("Populating");
 
         let mut consecutive_empty_msg = 0;
@@ -220,6 +230,9 @@ pub struct Config {
 
     #[serde(default = "default_data_dir")]
     pub data_dir: PathBuf,
+
+    #[serde(default)]
+    pub skip_populate: bool,
 }
 
 fn default_data_dir() -> PathBuf {
