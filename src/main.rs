@@ -50,6 +50,8 @@ impl App<()> {
         info!("Starting up...");
         info!("Using config: {:?}", config);
 
+        tokio::fs::create_dir_all(&config.data_dir).await?;
+
         let db = Messages::open(config.data_dir.join("main.db"))?.pipe(Rc::new);
         let (client, handle) = tdlib::init(config)
             .await
@@ -75,7 +77,7 @@ impl App<i64> {
                 update = self.handle.next_update() => {
                     if let Some(update) = update {
                         if let Err(e) = self.handle_update(update).await {
-                            warn!("{e}")
+                            warn!("{e:#?}")
                         }
                     } else {
                         break
@@ -238,6 +240,8 @@ impl Config {
             let config_dir = dirs::config_dir()
                 .expect("Config dir cannot be found")
                 .join("realmkbot");
+
+            info!("Config dir: {}", config_dir.join("config.toml").display());
 
             Figment::new()
                 .merge(Env::raw())
