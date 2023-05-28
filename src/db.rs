@@ -50,8 +50,8 @@ impl Messages {
 
     pub fn random(&self, limit: u8) -> Result<Vec<SearchResult>> {
         self.prepare(
-            "SELECT in_chat_id, text FROM message WHERE is_forwarded = TRUE ORDER BY RANDOM() \
-             LIMIT ? ",
+            "SELECT in_chat_id, text FROM message WHERE is_forwarded = TRUE AND text IS NOT NULL \
+             ORDER BY RANDOM() LIMIT ? ",
         )?
         .query_map([limit], |row| {
             SearchResult {
