@@ -1,0 +1,13 @@
+{
+  "cSpell.words": [
+    "realmkbot"
+  ],
+  "sqltools.connections": [
+    {
+      "previewLimit": 50,
+      "driver": "SQLite",
+      "name": "realmkbot",
+      "database": "${workspaceFolder:realmkbot}/data/main.db"
+    }
+  ]
+}

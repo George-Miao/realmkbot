@@ -1,20 +1,30 @@
-#![feature(lazy_cell)]
+#![feature(lazy_cell, type_changing_struct_update)]
 
 #[macro_use]
 extern crate log;
 
-use std::{env, path::PathBuf, sync::LazyLock};
+use std::{env, path::PathBuf, rc::Rc, sync::LazyLock};
 
 use color_eyre::{eyre::Context, Result};
-use rust_tdlib::types::*;
+use redacted_debug::RedactedDebug;
+use rust_tdlib::{
+    client::{tdlib_client::TdJson, Client},
+    types::*,
+};
 use serde::Deserialize;
-use tap::Tap;
+use tap::Pipe;
+use tokio::{select, signal::ctrl_c};
+
+use crate::{
+    db::{MessageRecord, Messages},
+    tdlib::WorkerHandle,
+};
 
 mod db;
-mod tg;
+mod tdlib;
 
-#[tokio::main]
-async fn main() {
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
     color_eyre::install().unwrap();
     if env::var("RUST_LOG").is_err() {
@@ -22,63 +32,174 @@ async fn main() {
     }
     pretty_env_logger::init();
 
-    run().await.unwrap()
+    App::init().await?.load_chat_id().await?.run().await
 }
 
-async fn run() -> Result<()> {
-    let config = Config::load();
+struct App<ID> {
+    config: &'static Config,
+    db: Rc<Messages>,
+    client: Client<TdJson>,
+    chat_id: ID,
+    handle: WorkerHandle,
+}
 
-    info!("Starting up...");
-    info!("Using config: {:?}", config);
+impl App<()> {
+    async fn init() -> Result<Self> {
+        let config = Config::load();
 
-    let (client, handle) = tg::init(config, |_, u| {
-        // info!("Update: {:?}", u);
+        info!("Starting up...");
+        info!("Using config: {:?}", config);
+
+        let db = Messages::open(config.data_dir.join("main.db"))?.pipe(Rc::new);
+        let (client, handle) = tdlib::init(config)
+            .await
+            .wrap_err("Failed to initialize TDLib")?;
+        let this = Self {
+            config,
+            db,
+            client,
+            chat_id: (),
+            handle,
+        };
+        this.populate().await?;
+        Ok(this)
+    }
+}
+
+impl App<i64> {
+    async fn run(&mut self) -> Result<()> {
+        loop {
+            select! {
+                update = self.handle.next_update() => {
+                    if let Some(update) = update {
+                        if let Err(e) = self.handle_update(update).await {
+                            warn!("{e}")
+                        }
+                    } else {
+                        break
+                    }
+                },
+                _ = ctrl_c() => { break }
+            };
+        }
         Ok(())
-    })
-    .await
-    .wrap_err("Failed to initialize TDLib")?;
-
-    let db = db::init(config).await?;
-
-    for i in 100..110 {
-        if let Some((msg, text)) = client
-            .get_message_link_info(
-                GetMessageLinkInfo::builder()
-                    .url(format!("tg:resolve?domain={}&post={}", config.chat_name, i))
-                    .build(),
-            )
-            .await?
-            .message()
-            .as_ref()
-            .and_then(|msg| match msg.content() {
-                MessageContent::MessageText(text) => Some((msg, text)),
-                _ => None,
-            })
-        {
-            let text = text.text().text();
-            info!("{}: {}", i, text);
-            db.insert(i, text)?;
-        }
     }
 
-    {
-        let tx = db.tx(false)?;
-        let mut cursor = tx.cursor()?;
+    async fn handle_update(&self, update: Box<Update>) -> Result<()> {
+        match *update {
+            Update::NewInlineQuery(query) => {
+                info!("New query from {}", query.sender_user_id());
 
-        while let Some(Ok((index, msg))) = cursor.next() {
-            info!("{}: {}", index, msg);
+                let results = if query.query().is_empty() {
+                    self.db.random(10)?
+                } else {
+                    self.db.search(query.query(), 10)?
+                }
+                .into_iter()
+                .map(InputInlineQueryResult::from)
+                .collect();
+
+                AnswerInlineQuery::builder()
+                    .inline_query_id(query.id())
+                    .cache_time(0)
+                    .results(results)
+                    .build()
+                    .pipe(|a| self.client.answer_inline_query(a))
+                    .await?;
+            }
+            Update::NewMessage(msg) => {
+                if msg.message().chat_id() != self.chat_id {
+                    return Result::<()>::Ok(());
+                }
+
+                info!("New message in channel");
+                debug!("{msg:?}");
+
+                let link = GetMessageLink::builder()
+                    .chat_id(self.chat_id)
+                    .message_id(msg.message().id())
+                    .build()
+                    .pipe(|r| self.client.get_message_link(r))
+                    .await?;
+
+                let Some(in_chat_id) = link.link().split('/').last().and_then(|x| x.parse().ok())
+                else { return Ok(()); };
+
+                let msg = MessageRecord::from_raw(msg.message().to_owned(), in_chat_id)?;
+                self.db.insert_one(&msg)?;
+            }
+            u => {
+                debug!("{u:?}")
+            }
         }
+        Ok(())
     }
-    handle.join().await?;
-
-    Ok(())
 }
 
-#[derive(Debug, Deserialize)]
+impl<ID> App<ID> {
+    async fn load_chat_id(self) -> Result<App<i64>> {
+        let chat_id = GetMessageLinkInfo::builder()
+            .url(format!(
+                "tg:resolve?domain={}&post=1",
+                self.config.chat_name
+            ))
+            .build()
+            .pipe(|s| self.client.get_message_link_info(s))
+            .await?
+            .chat_id();
+
+        Ok(App { chat_id, ..self })
+    }
+
+    async fn populate(&self) -> Result<()> {
+        info!("Populating");
+
+        let mut consecutive_empty_msg = 0;
+
+        for id in 1.. {
+            if consecutive_empty_msg > 10 {
+                break;
+            }
+
+            if self.db.exists(id)? {
+                consecutive_empty_msg = 0;
+                continue;
+            }
+
+            debug!("Getting {id}");
+            let res = GetMessageLinkInfo::builder()
+                .url(format!(
+                    "tg:resolve?domain={}&post={}",
+                    self.config.chat_name, id
+                ))
+                .build()
+                .pipe(|s| self.client.get_message_link_info(s))
+                .await?
+                .message()
+                .to_owned();
+
+            let Some(msg) = res else {
+                consecutive_empty_msg += 1;
+                continue;
+            };
+
+            consecutive_empty_msg = 0;
+            MessageRecord::from_raw(msg, id)?.pipe(|msg| self.db.insert_one(&msg))?;
+            debug!("Added");
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(RedactedDebug, Deserialize)]
 pub struct Config {
+    #[redacted]
     pub bot_token: String,
     pub chat_name: String,
+    #[redacted]
     pub api_id: i32,
+    #[redacted]
     pub api_hash: String,
 
     #[serde(default = "default_data_dir")]
@@ -100,14 +221,18 @@ impl Config {
 
         static CONFIG: LazyLock<Config> = LazyLock::new(|| {
             dotenvy::dotenv().ok();
+            let config_dir = dirs::config_dir()
+                .expect("Config dir cannot be found")
+                .join("realmkbot");
 
             Figment::new()
                 .merge(Env::raw())
                 .merge(Toml::file("config.toml"))
+                .merge(Toml::file(config_dir.join("config.toml")))
                 .merge(Json::file("config.json"))
+                .merge(Json::file(config_dir.join("config.json")))
                 .extract()
-                .wrap_err("Failed to load config")
-                .unwrap()
+                .expect("Failed to load config")
         });
 
         &CONFIG

@@ -5,38 +5,37 @@ use rust_tdlib::{
         auth_handler::ClientAuthStateHandler, tdlib_client::TdJson, AuthStateHandler, Client,
         ClientIdentifier, Worker,
     },
+    tdjson::set_log_verbosity_level,
     types::*,
 };
-use tokio::task::{JoinError, JoinHandle};
+use tokio::{sync::mpsc::Receiver, task::JoinHandle};
 
 use crate::Config;
 
 #[derive(Debug)]
 pub struct WorkerHandle {
-    handle: JoinHandle<()>,
-    worker: Worker<BotTokenHandler, TdJson>,
+    _bg: JoinHandle<()>,
+    _worker: Worker<BotTokenHandler, TdJson>,
+    recv: Receiver<Box<Update>>,
 }
 
 impl WorkerHandle {
-    pub async fn join(self) -> Result<(), JoinError> {
-        self.handle.await
-    }
+    // pub async fn join(self) -> Result<(), JoinError> {
+    //     self.background.await
+    // }
 
-    pub fn worker(&self) -> &Worker<BotTokenHandler, TdJson> {
-        &self.worker
+    pub async fn next_update(&mut self) -> Option<Box<Update>> {
+        self.recv.recv().await
     }
 }
 
-pub async fn init(
-    config: &Config,
-    mut handler: impl FnMut(&Client<TdJson>, Box<Update>) -> Result<()> + Send + 'static,
-) -> Result<(Client<TdJson>, WorkerHandle)> {
+pub async fn init(config: &Config) -> Result<(Client<TdJson>, WorkerHandle)> {
     let mut worker = Worker::builder()
         .with_auth_state_handler(BotTokenHandler {
             bot_token: config.bot_token.clone(),
         })
         .build()?;
-    let handle = worker.start();
+    let background = worker.start();
 
     let tdlib_params = TdlibParameters::builder()
         .database_directory(
@@ -56,32 +55,24 @@ pub async fn init(
         .build();
 
     // The buffer should be big enough for all initial updates to arrive
-    let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+    let (send, recv) = tokio::sync::mpsc::channel(1024);
 
     let client = rust_tdlib::client::Client::builder()
         .with_client_auth_state_handler(BotTokenHandler {
             bot_token: config.bot_token.clone(),
         })
-        .with_updates_sender(tx)
+        .with_auth_state_channel(64)
+        .with_updates_sender(send)
         .with_tdlib_parameters(tdlib_params)
         .build()?;
+
+    set_log_verbosity_level(1);
 
     info!("TDLib logging in");
 
     let client = worker.bind_client(client).await?;
 
-    info!("TDLib logged in, suppressing logs");
-
-    tokio::spawn({
-        let client = client.clone();
-        async move {
-            while let Some(update) = rx.recv().await {
-                if let Err(e) = handler(&client, update) {
-                    error!("Error handling update: {:?}", e);
-                }
-            }
-        }
-    });
+    info!("TDLib logged in");
 
     client
         .set_log_verbosity_level(
@@ -93,7 +84,14 @@ pub async fn init(
 
     info!("Preparation completed");
 
-    Ok((client, WorkerHandle { handle, worker }))
+    Ok((
+        client,
+        WorkerHandle {
+            _bg: background,
+            _worker: worker,
+            recv,
+        },
+    ))
 }
 
 #[derive(Debug, Clone)]
