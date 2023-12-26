@@ -43,11 +43,6 @@ impl Messages {
         Ok(self)
     }
 
-    // pub fn max_in_chat_id(&self) -> Result<i64> {
-    //     self.query_row("SELECT max(in_chat_id) FROM message", (), |res|
-    // res.get(0))         .wrap_err("Failed to get `max_in_chat_id`")
-    // }
-
     pub fn random(&self, limit: u8) -> Result<Vec<SearchResult>> {
         self.prepare(
             "SELECT in_chat_id, text FROM message WHERE is_forwarded = TRUE AND text IS NOT NULL \
@@ -84,8 +79,7 @@ impl Messages {
 
     pub fn insert_one(&self, msg: &MessageRecord) -> Result<()> {
         self.execute(
-            "INSERT OR REPLACE INTO message (id, in_chat_id, text, is_forwarded, raw) VALUES (?1, \
-             ?2, ?3, ?4, ?5)",
+            r"INSERT OR REPLACE INTO message (id, in_chat_id, text, is_forwarded, raw) VALUES (?1, ?2, ?3, ?4, ?5)",
             (
                 &msg.id,
                 &msg.in_chat_id,
@@ -96,6 +90,21 @@ impl Messages {
         )
         .wrap_err("Failed to insert message")
         .map(|_| ())
+    }
+
+    pub fn delete(&self, ids: &[i64]) -> Result<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+
+        info!("Deleting {ids:?}");
+
+        let mut num = 0;
+        for id in ids {
+            num += self.execute("DELETE FROM message WHERE id = ?1", (id,))?;
+        }
+
+        Ok(num)
     }
 
     pub fn exists(&self, in_chat_id: i64) -> Result<bool> {

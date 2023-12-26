@@ -98,8 +98,26 @@ impl App<i64> {
 
     async fn handle_update(&self, update: Box<Update>) -> Result<()> {
         match *update {
+            Update::DeleteMessages(update) => {
+                if update.chat_id() != self.chat_id {
+                    debug!(
+                        "Unknown channel, skip ({} != {})",
+                        update.chat_id(),
+                        self.chat_id
+                    );
+
+                    return Result::<()>::Ok(());
+                }
+
+                debug!("{update:?}");
+
+                self.db
+                    .delete(update.message_ids())?
+                    .pipe(|num| info!("{num} message(s) deleted"));
+            }
             Update::NewInlineQuery(query) => {
                 info!("New query from {}", query.sender_user_id());
+                debug!("{query:?}");
 
                 let results = if query.query().is_empty() {
                     self.db.random(10)?
@@ -120,6 +138,12 @@ impl App<i64> {
             }
             Update::NewMessage(msg) => {
                 if msg.message().chat_id() != self.chat_id {
+                    debug!(
+                        "Unknown channel, skip ({} != {})",
+                        msg.message().chat_id(),
+                        self.chat_id
+                    );
+
                     return Result::<()>::Ok(());
                 }
 
@@ -257,11 +281,11 @@ impl Config {
             info!("Config dir: {}", config_dir.join("config.toml").display());
 
             Figment::new()
-                .merge(Env::raw())
-                .merge(Toml::file("config.toml"))
+                .merge(Json::file(config_dir.join("config.json")))
                 .merge(Toml::file(config_dir.join("config.toml")))
                 .merge(Json::file("config.json"))
-                .merge(Json::file(config_dir.join("config.json")))
+                .merge(Toml::file("config.toml"))
+                .merge(Env::raw())
                 .extract()
                 .expect("Failed to load config")
         });
