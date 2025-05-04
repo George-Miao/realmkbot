@@ -37,11 +37,20 @@
           doCheck = false;
           nativeBuildInputs = buildInputs;
         };
+
+        docker = pkgs.dockerTools.buildLayeredImage {
+          name = "realmkbot";
+          created = "now";
+          tag = "latest";
+          config = {
+            Cmd = ["${realmkbot}/bin/realmkbot"];
+          };
+        };
       in
         with pkgs; {
           packages = {
+            inherit docker realmkbot;
             default = realmkbot;
-            realmkbot = realmkbot;
           };
 
           apps.default = flake-utils.lib.mkApp {

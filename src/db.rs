@@ -146,11 +146,7 @@ impl From<SearchResult> for Article {
 }
 
 impl MessageRecord {
-    // pub fn get_raw(&self) -> Result<Message, serde_json::Error> {
-    //     serde_json::from_slice(&self.raw)
-    // }
-
-    pub fn from_raw(msg: Message) -> Result<Self, serde_json::Error> {
+    pub fn from_raw(msg: Message) -> Self {
         let text = match msg.text() {
             "" => None,
             text => Some(text.to_string()),
@@ -162,6 +158,5 @@ impl MessageRecord {
             is_forwarded: msg.forward_header().is_some(),
             raw: msg.raw.to_bytes(),
         }
-        .pipe(Ok)
     }
 }

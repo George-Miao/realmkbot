@@ -172,7 +172,7 @@ impl App<Chat> {
                 }
 
                 consecutive_empty_msg = 0;
-                MessageRecord::from_raw(msg)?.pipe(|msg| self.db.insert_one(&msg))?;
+                MessageRecord::from_raw(msg).pipe(|msg| self.db.insert_one(&msg))?;
                 added += 1;
                 debug!("Added");
             }
@@ -199,6 +199,7 @@ impl App<Chat> {
                     return Result::<()>::Ok(());
                 }
 
+                info!("Message deleted in channel");
                 debug!("{update:?}");
 
                 self.db
@@ -234,7 +235,7 @@ impl App<Chat> {
                 info!("New message in channel");
                 debug!("{msg:?}");
 
-                let msg = MessageRecord::from_raw(msg)?;
+                let msg = MessageRecord::from_raw(msg);
                 self.db.insert_one(&msg)?;
             }
             u => {
