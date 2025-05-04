@@ -6,7 +6,6 @@ on:
     paths-ignore:
       - 'README.md'
       - 'LICENSE'
-      - '.github/**'
       - '.gitignore'
       - '.vscode/**'
 
@@ -64,8 +63,6 @@ jobs:
 
       - name: Push Docker image
         id: push
-        env:
-          IMAGE_PATH: ${{ env.IMAGE_PATH }}
         run: |
           SRC=docker-archive:$IMAGE_PATH
           DEST=docker://${{ steps.meta.outputs.tags }}
@@ -74,7 +71,7 @@ jobs:
             --dest-creds='${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}' \
             $SRC $DEST
           DIGEST=$(skopeo inspect $SRC | jq -r '.Digest')
-          echo "digest=$DIGEST" >> $GITHUB_ENV
+          echo "digest=$DIGEST" >> $GITHUB_OUTPUT
 
       # This step generates an artifact attestation for the image, which is an unforgeable statement about where and how it was built. It increases supply chain security for people who consume the image. For more information, see [Using artifact attestations to establish provenance for builds](/actions/security-guides/using-artifact-attestations-to-establish-provenance-for-builds).
       - name: Generate artifact attestation
