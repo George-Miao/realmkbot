@@ -4,12 +4,13 @@ use std::{
 };
 
 use color_eyre::{eyre::Context, Result};
+use grammers_client::grammers_tl_types::Serializable;
+use grammers_client::{
+    types::{inline::query::Article, Message},
+    InputMessage,
+};
 use rusqlite::{params, Connection};
 use rusqlite_migration::{Migrations, M};
-use rust_tdlib::types::{
-    FormattedText, InputInlineQueryResult, InputInlineQueryResultArticle, InputMessageContent,
-    InputMessageText, Message, MessageContent,
-};
 use serde::{Deserialize, Serialize};
 use tap::Pipe;
 
@@ -24,18 +25,14 @@ impl Messages {
 
     #[inline]
     fn pre_start(mut self) -> Result<Self> {
-        let migrations = Migrations::new(vec![
-            M::up(
-                "CREATE TABLE message  (
+        let migrations = Migrations::new(vec![M::up(
+            "CREATE TABLE message  (
                 id           INTEGER PRIMARY KEY,
-                in_chat_id   INTEGER NOT NULL,
                 text         TEXT,
                 is_forwarded BOOLEAN,
                 raw          BLOB
             )",
-            ),
-            M::up("CREATE UNIQUE INDEX message_in_chat_id ON message (in_chat_id)"),
-        ]);
+        )]);
 
         self.pragma_update(None, "journal_mode", "WAL")?;
         migrations.to_latest(&mut self)?;
@@ -45,12 +42,12 @@ impl Messages {
 
     pub fn random(&self, limit: u8) -> Result<Vec<SearchResult>> {
         self.prepare(
-            "SELECT in_chat_id, text FROM message WHERE is_forwarded = TRUE AND text IS NOT NULL \
+            "SELECT id, text FROM message WHERE is_forwarded = TRUE AND text IS NOT NULL \
              ORDER BY RANDOM() LIMIT ?",
         )?
         .query_map([limit], |row| {
             SearchResult {
-                in_chat_id: row.get(0)?,
+                id: row.get(0)?,
                 text: row.get(1)?,
             }
             .pipe(Ok)
@@ -62,12 +59,12 @@ impl Messages {
 
     pub fn search(&self, reg: &str, limit: u8) -> Result<Vec<SearchResult>> {
         self.prepare(
-            "SELECT in_chat_id, text FROM message WHERE text IS NOT NULL AND text LIKE ?1 AND \
+            "SELECT id, text FROM message WHERE text IS NOT NULL AND text LIKE ?1 AND \
              is_forwarded = TRUE LIMIT ?2",
         )?
         .query_map(params![format!("%{reg}%"), limit], |row| {
             SearchResult {
-                in_chat_id: row.get(0)?,
+                id: row.get(0)?,
                 text: row.get(1)?,
             }
             .pipe(Ok)
@@ -79,20 +76,14 @@ impl Messages {
 
     pub fn insert_one(&self, msg: &MessageRecord) -> Result<()> {
         self.execute(
-            r"INSERT OR REPLACE INTO message (id, in_chat_id, text, is_forwarded, raw) VALUES (?1, ?2, ?3, ?4, ?5)",
-            (
-                &msg.id,
-                &msg.in_chat_id,
-                &msg.text,
-                &msg.is_forwarded,
-                &msg.raw,
-            ),
+            r"INSERT OR REPLACE INTO message (id, text, is_forwarded, raw) VALUES (?1, ?2, ?3, ?4)",
+            (&msg.id, &msg.text, &msg.is_forwarded, &msg.raw),
         )
         .wrap_err("Failed to insert message")
         .map(|_| ())
     }
 
-    pub fn delete(&self, ids: &[i64]) -> Result<usize> {
+    pub fn delete(&self, ids: &[i32]) -> Result<usize> {
         if ids.is_empty() {
             return Ok(0);
         }
@@ -107,10 +98,10 @@ impl Messages {
         Ok(num)
     }
 
-    pub fn exists(&self, in_chat_id: i64) -> Result<bool> {
+    pub fn exists(&self, id: i32) -> Result<bool> {
         self.query_row(
-            "SELECT EXISTS(SELECT 1 FROM message WHERE in_chat_id = ?1)",
-            [in_chat_id],
+            "SELECT EXISTS(SELECT 1 FROM message WHERE id = ?1)",
+            [id],
             |res| res.get(0),
         )
         .wrap_err("Failed to check if message exists")
@@ -133,8 +124,7 @@ impl DerefMut for Messages {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageRecord {
-    pub id: i64,
-    pub in_chat_id: i64,
+    pub id: i32,
     pub text: Option<String>,
     pub is_forwarded: bool,
     pub raw: Vec<u8>,
@@ -142,8 +132,17 @@ pub struct MessageRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
-    pub in_chat_id: i64,
+    pub id: i32,
     pub text: String,
+}
+
+impl From<SearchResult> for Article {
+    fn from(x: SearchResult) -> Self {
+        let msg = InputMessage::text(&x.text);
+        Article::new(x.text, msg)
+            .id(format!("{}", x.id))
+            .description(format!("#{}", x.id))
+    }
 }
 
 impl MessageRecord {
@@ -151,38 +150,18 @@ impl MessageRecord {
     //     serde_json::from_slice(&self.raw)
     // }
 
-    pub fn from_raw(msg: Message, in_chat_id: i64) -> Result<Self, serde_json::Error> {
-        let text = match msg.content() {
-            MessageContent::MessageText(text) => text.text().text().to_owned().pipe(Some),
-            _ => None,
+    pub fn from_raw(msg: Message) -> Result<Self, serde_json::Error> {
+        let text = match msg.text() {
+            "" => None,
+            text => Some(text.to_string()),
         };
 
         Self {
             id: msg.id(),
-            in_chat_id,
             text,
-            is_forwarded: msg.forward_info().is_some(),
-            raw: serde_json::to_vec(&msg)?,
+            is_forwarded: msg.forward_header().is_some(),
+            raw: msg.raw.to_bytes(),
         }
         .pipe(Ok)
-    }
-}
-
-impl From<SearchResult> for InputInlineQueryResult {
-    fn from(value: SearchResult) -> Self {
-        InputInlineQueryResultArticle::builder()
-            .id(value.in_chat_id.to_string())
-            .description(format!("#{}", value.in_chat_id))
-            .title(value.text.clone())
-            .hide_url(true)
-            .input_message_content(
-                FormattedText::builder()
-                    .text(value.text)
-                    .build()
-                    .pipe(|text| InputMessageText::builder().text(text).build())
-                    .pipe(InputMessageContent::InputMessageText),
-            )
-            .build()
-            .pipe(InputInlineQueryResult::Article)
     }
 }

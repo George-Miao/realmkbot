@@ -5,23 +5,23 @@ extern crate log;
 
 use std::{env, path::PathBuf, rc::Rc, sync::LazyLock};
 
-use color_eyre::{eyre::Context, Result};
-use redacted_debug::RedactedDebug;
-use rust_tdlib::{
-    client::{tdlib_client::TdJson, Client},
-    types::*,
+use color_eyre::{
+    eyre::{eyre, Context},
+    Result,
 };
+use grammers_client::{
+    session::Session,
+    types::{inline::query::Article, Chat},
+    Client, FixedReconnect, InitParams, Update,
+};
+use redacted_debug::RedactedDebug;
 use serde::Deserialize;
 use tap::Pipe;
 use tokio::{select, signal::ctrl_c};
 
-use crate::{
-    db::{MessageRecord, Messages},
-    tdlib::WorkerHandle,
-};
+use crate::db::{MessageRecord, Messages};
 
 mod db;
-mod tdlib;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
@@ -32,15 +32,21 @@ async fn main() -> Result<()> {
     }
     pretty_env_logger::init();
 
-    App::init().await?.load_chat_id().await?.run().await
+    App::init()
+        .await?
+        .load_chat()
+        .await?
+        .populated()
+        .await?
+        .run()
+        .await
 }
 
-struct App<ID> {
+struct App<C> {
     config: &'static Config,
     db: Rc<Messages>,
-    client: Client<TdJson>,
-    chat_id: ID,
-    handle: WorkerHandle,
+    client: Client,
+    chat: C,
 }
 
 impl App<()> {
@@ -53,39 +59,64 @@ impl App<()> {
         tokio::fs::create_dir_all(&config.data_dir).await?;
 
         let db = Messages::open(config.data_dir.join("main.db"))?.pipe(Rc::new);
-        let (client, handle) = tdlib::init(config)
-            .await
-            .wrap_err("Failed to initialize TDLib")?;
+        const RECON: FixedReconnect = FixedReconnect {
+            attempts: 5,
+            delay: std::time::Duration::from_secs(1),
+        };
+        let app_config = Config::load();
+
+        let session = Session::load_file_or_create(config.data_dir.join("session"))
+            .wrap_err("Failed to load session")?;
+
+        let tg_config = grammers_client::Config {
+            session,
+            api_hash: app_config.api_hash.clone(),
+            api_id: app_config.api_id,
+            params: InitParams {
+                device_model: "Desktop".to_owned(),
+                system_version: "0.0".to_owned(),
+                app_version: concat!("realmkbot ", env!("CARGO_PKG_VERSION")).to_owned(),
+                system_lang_code: "en".to_owned(),
+                lang_code: "en".to_owned(),
+                catch_up: true,
+                server_addr: None,
+                flood_sleep_threshold: 0,
+                update_queue_limit: None,
+                reconnection_policy: &RECON,
+            },
+        };
+
+        let client = grammers_client::Client::connect(tg_config).await.unwrap();
+        client.bot_sign_in(&app_config.bot_token).await.unwrap();
+        let me = client.get_me().await.unwrap().raw;
+        println!("Logged in as: {:?}", me.username);
+
         let this = Self {
             config,
             db,
             client,
-            chat_id: (),
-            handle,
+            chat: (),
         };
+
         this.client
-            .get_me(GetMe::builder().build())
+            .get_me()
             .await?
             .first_name()
             .pipe(|x| info!("Logged in as @{x}"));
-        this.populate().await?;
+
         Ok(this)
     }
 }
 
-impl App<i64> {
+impl App<Chat> {
     async fn run(&mut self) -> Result<()> {
         info!("Running");
 
         loop {
             select! {
-                update = self.handle.next_update() => {
-                    if let Some(update) = update {
-                        if let Err(e) = self.handle_update(update).await {
-                            warn!("{e:#?}")
-                        }
-                    } else {
-                        break
+                update = self.client.next_update() => {
+                    if let Err(e) = self.handle_update(update?).await {
+                        warn!("{e:#?}")
                     }
                 },
                 _ = ctrl_c() => { break }
@@ -96,103 +127,14 @@ impl App<i64> {
         Ok(())
     }
 
-    async fn handle_update(&self, update: Box<Update>) -> Result<()> {
-        match *update {
-            Update::DeleteMessages(update) => {
-                if update.chat_id() != self.chat_id {
-                    debug!(
-                        "Unknown channel, skip ({} != {})",
-                        update.chat_id(),
-                        self.chat_id
-                    );
-
-                    return Result::<()>::Ok(());
-                }
-
-                debug!("{update:?}");
-
-                self.db
-                    .delete(update.message_ids())?
-                    .pipe(|num| info!("{num} message(s) deleted"));
-            }
-            Update::NewInlineQuery(query) => {
-                info!("New query from {}", query.sender_user_id());
-                debug!("{query:?}");
-
-                let results = if query.query().is_empty() {
-                    self.db.random(10)?
-                } else {
-                    self.db.search(query.query(), 10)?
-                }
-                .into_iter()
-                .map(InputInlineQueryResult::from)
-                .collect();
-
-                AnswerInlineQuery::builder()
-                    .inline_query_id(query.id())
-                    .cache_time(0)
-                    .results(results)
-                    .build()
-                    .pipe(|a| self.client.answer_inline_query(a))
-                    .await?;
-            }
-            Update::NewMessage(msg) => {
-                if msg.message().chat_id() != self.chat_id {
-                    debug!(
-                        "Unknown channel, skip ({} != {})",
-                        msg.message().chat_id(),
-                        self.chat_id
-                    );
-
-                    return Result::<()>::Ok(());
-                }
-
-                info!("New message in channel");
-                debug!("{msg:?}");
-
-                let link = GetMessageLink::builder()
-                    .chat_id(self.chat_id)
-                    .message_id(msg.message().id())
-                    .build()
-                    .pipe(|r| self.client.get_message_link(r))
-                    .await?;
-
-                let Some(in_chat_id) = link.link().split('/').last().and_then(|x| x.parse().ok())
-                else { return Ok(()); };
-
-                let msg = MessageRecord::from_raw(msg.message().to_owned(), in_chat_id)?;
-                self.db.insert_one(&msg)?;
-            }
-            u => {
-                debug!("{u:?}")
-            }
-        }
-        Ok(())
-    }
-}
-
-impl<ID> App<ID> {
-    async fn load_chat_id(self) -> Result<App<i64>> {
-        let chat_id = GetMessageLinkInfo::builder()
-            .url(format!(
-                "tg:resolve?domain={}&post=1",
-                self.config.chat_name
-            ))
-            .build()
-            .pipe(|s| self.client.get_message_link_info(s))
-            .await?
-            .chat_id();
-
-        Ok(App {
-            chat_id,
-            config: self.config,
-            db: self.db,
-            client: self.client,
-            handle: self.handle,
-        })
+    async fn populated(self) -> Result<Self> {
+        self.populate().await?;
+        Ok(self)
     }
 
     async fn populate(&self) -> Result<()> {
+        const STEP: i32 = 128;
+
         if self.config.skip_populate {
             info!("Skipped populating");
             return Ok(());
@@ -203,42 +145,120 @@ impl<ID> App<ID> {
         let mut consecutive_empty_msg = 0;
         let mut added = 0;
 
-        for id in 1.. {
-            if consecutive_empty_msg > 10 {
-                break;
-            }
+        'outter: for lower in (1..).step_by(STEP as _) {
+            let upper = lower + STEP - 1;
 
-            if self.db.exists(id)? {
+            debug!("Getting {lower}..={upper}");
+
+            let msg_ids = (lower..=upper).collect::<Vec<_>>();
+            let res = self
+                .client
+                .get_messages_by_id(&self.chat, msg_ids.as_slice())
+                .await?;
+
+            for msg in res {
+                if consecutive_empty_msg > 10 {
+                    break 'outter;
+                }
+
+                let Some(msg) = msg else {
+                    consecutive_empty_msg += 1;
+                    continue;
+                };
+
+                if self.db.exists(msg.id())? {
+                    consecutive_empty_msg = 0;
+                    continue;
+                }
+
                 consecutive_empty_msg = 0;
-                continue;
+                MessageRecord::from_raw(msg)?.pipe(|msg| self.db.insert_one(&msg))?;
+                added += 1;
+                debug!("Added");
             }
 
-            debug!("Getting {id}");
-            let res = GetMessageLinkInfo::builder()
-                .url(format!(
-                    "tg:resolve?domain={}&post={}",
-                    self.config.chat_name, id
-                ))
-                .build()
-                .pipe(|s| self.client.get_message_link_info(s))
-                .await?
-                .message()
-                .to_owned();
-
-            let Some(msg) = res else {
-                consecutive_empty_msg += 1;
-                continue;
-            };
-
-            consecutive_empty_msg = 0;
-            MessageRecord::from_raw(msg, id)?.pipe(|msg| self.db.insert_one(&msg))?;
-            added += 1;
-            debug!("Added");
+            info!("Added {added} message(s), wait for half minutes");
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
         }
 
         info!("Done, {added} message(s) added");
 
         Ok(())
+    }
+
+    async fn handle_update(&self, update: Update) -> Result<()> {
+        match update {
+            Update::MessageDeleted(update) => {
+                if update.channel_id() != Some(self.chat.id()) {
+                    debug!(
+                        "Unknown channel, skip ({:?} != {})",
+                        update.channel_id(),
+                        self.chat.id()
+                    );
+
+                    return Result::<()>::Ok(());
+                }
+
+                debug!("{update:?}");
+
+                self.db
+                    .delete(update.messages())?
+                    .pipe(|num| info!("{num} message(s) deleted"));
+            }
+            Update::InlineQuery(query) => {
+                info!("New query from {}", query.sender().id());
+                debug!("{query:?}");
+
+                let results = if query.text().is_empty() {
+                    self.db.random(10)?
+                } else {
+                    self.db.search(query.text(), 10)?
+                }
+                .into_iter()
+                .map(Into::<Article>::into)
+                .map(Into::into);
+
+                query.answer(results).cache_time(0).send().await?;
+            }
+            Update::NewMessage(msg) => {
+                if msg.chat().id() != self.chat.id() {
+                    debug!(
+                        "Unknown channel, skip ({} != {})",
+                        msg.chat().id(),
+                        self.chat.id()
+                    );
+
+                    return Result::<()>::Ok(());
+                }
+
+                info!("New message in channel");
+                debug!("{msg:?}");
+
+                let msg = MessageRecord::from_raw(msg)?;
+                self.db.insert_one(&msg)?;
+            }
+            u => {
+                debug!("{u:?}")
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<C> App<C> {
+    async fn load_chat(self) -> Result<App<Chat>> {
+        let chat = self
+            .client
+            .resolve_username(&self.config.chat_name)
+            .await?
+            .ok_or_else(|| eyre!("Failed to resolve chat name {}", self.config.chat_name))?;
+
+        Ok(App {
+            chat,
+            config: self.config,
+            db: self.db,
+            client: self.client,
+        })
     }
 }
 
