@@ -5,6 +5,7 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     rust-overlay.url = "github:oxalica/rust-overlay";
     flake-utils.url = "github:numtide/flake-utils";
+    crane.url = "github:ipetkov/crane";
     rust-overlay.inputs.nixpkgs.follows = "nixpkgs";
   };
 
@@ -12,6 +13,7 @@
     nixpkgs,
     rust-overlay,
     flake-utils,
+    crane,
     ...
   }:
     flake-utils.lib.eachDefaultSystem (
@@ -20,15 +22,34 @@
         pkgs = import nixpkgs {
           inherit system overlays;
         };
+        rust = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+        craneLib = (crane.mkLib pkgs).overrideToolchain (p: rust);
+        buildInputs = with pkgs; [
+          openssl
+          pkg-config
+          rust
+        ];
+
+        realmkbot = craneLib.buildPackage {
+          src = ./.;
+          pname = "realmkbot";
+          strictDeps = true;
+          doCheck = false;
+          nativeBuildInputs = buildInputs;
+        };
       in
         with pkgs; {
+          packages = {
+            default = realmkbot;
+            realmkbot = realmkbot;
+          };
+
+          apps.default = flake-utils.lib.mkApp {
+            drv = realmkbot;
+          };
+
           devShells.default = mkShell {
-            buildInputs = [
-              glib
-              openssl
-              pkg-config
-              (rust-bin.fromRustupToolchainFile ./rust-toolchain.toml)
-            ];
+            inherit buildInputs;
           };
         }
     );
