@@ -56,22 +56,25 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=sha
+      - name: Install skopeo
+        uses: awalsh128/cache-apt-pkgs-action@latest
+        with:
+          packages: skopeo
+          version: ${{ steps.meta.outputs.tags }}
 
       - name: Push Docker image
         id: push
         env:
           IMAGE_PATH: ${{ env.IMAGE_PATH }}
         run: |
-          apt update
-          apt install -y skopeo
-
-          TAGS=$(echo "${{ steps.meta.outputs.tags }}" | sed 's/,/ /g')
-
+          SRC=docker-archive:$IMAGE_PATH
+          DEST=docker://${{ steps.meta.outputs.tags }}
           skopeo copy \
             --src-no-creds \
             --dest-creds='${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}' \
-            docker-archive:$IMAGE_PATH \
-            docker://${{ steps.meta.outputs.tags }}
+            $SRC $DEST
+          DIGEST=$(skopeo inspect $SRC | jq -r '.Digest')
+          echo "digest=$DIGEST" >> $GITHUB_ENV
 
       # This step generates an artifact attestation for the image, which is an unforgeable statement about where and how it was built. It increases supply chain security for people who consume the image. For more information, see [Using artifact attestations to establish provenance for builds](/actions/security-guides/using-artifact-attestations-to-establish-provenance-for-builds).
       - name: Generate artifact attestation
