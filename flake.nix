@@ -58,7 +58,11 @@
           };
 
           devShells.default = mkShell {
-            inherit buildInputs;
+            buildInputs = with pkgs;
+              [
+                infisical
+              ]
+              ++ buildInputs;
           };
         }
     );

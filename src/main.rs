@@ -1,18 +1,23 @@
-#![feature(lazy_cell, type_changing_struct_update, duration_constants)]
+#![feature(type_changing_struct_update, duration_constants)]
 
 #[macro_use]
 extern crate log;
 
-use std::{env, path::PathBuf, rc::Rc, sync::LazyLock};
+use std::{env, path::PathBuf, pin::pin, rc::Rc, sync::LazyLock};
 
 use color_eyre::{
-    eyre::{eyre, Context},
     Result,
+    eyre::{Context, eyre},
+};
+use futures::{
+    StreamExt,
+    future::{Either, select},
+    stream::FuturesUnordered,
 };
 use grammers_client::{
-    session::Session,
-    types::{inline::query::Article, Chat},
     Client, FixedReconnect, InitParams, Update,
+    session::Session,
+    types::{Chat, inline::query::Article},
 };
 use redacted_debug::RedactedDebug;
 use serde::Deserialize;
@@ -89,7 +94,7 @@ impl App<()> {
         let client = grammers_client::Client::connect(tg_config).await.unwrap();
         client.bot_sign_in(&app_config.bot_token).await.unwrap();
         let me = client.get_me().await.unwrap().raw;
-        println!("Logged in as: {:?}", me.username);
+        info!("Logged in as: {:?}", me.username);
 
         let this = Self {
             config,
@@ -97,12 +102,6 @@ impl App<()> {
             client,
             chat: (),
         };
-
-        this.client
-            .get_me()
-            .await?
-            .first_name()
-            .pipe(|x| info!("Logged in as @{x}"));
 
         Ok(this)
     }
@@ -112,18 +111,35 @@ impl App<Chat> {
     async fn run(&mut self) -> Result<()> {
         info!("Running");
 
+        let mut pool = FuturesUnordered::new();
+
         loop {
             select! {
                 update = self.client.next_update() => {
-                    if let Err(e) = self.handle_update(update?).await {
-                        warn!("{e:#?}")
-                    }
+                    let update = update?;
+                    pool.push(self.handle_update(update));
                 },
-                _ = ctrl_c() => { break }
+                result = pool.next() => {
+                    if let Some(Err(e)) = result {
+                        warn!("Error handling update: {e:?}");
+                    }
+                }
+                _ = ctrl_c() => {
+                    info!("CTRL-C received, shutting down");
+                    loop {
+                        match select(pool.next(), pin!(ctrl_c())).await {
+                            Either::Left(_) => {}
+                            Either::Right(_) => {
+                                info!("CTRL-C received again, shutting down immediately");
+                                break;
+                            }
+                        }
+                    }
+                    break
+                 }
             };
         }
 
-        info!("Shutting down");
         Ok(())
     }
 
@@ -289,8 +305,8 @@ fn default_data_dir() -> PathBuf {
 impl Config {
     pub fn load<'a>() -> &'a Self {
         use figment::{
-            providers::{Env, Format, Json, Toml},
             Figment,
+            providers::{Env, Format, Json, Toml},
         };
 
         static CONFIG: LazyLock<Config> = LazyLock::new(|| {
