@@ -10,15 +10,15 @@ use grammers_client::{
     grammers_tl_types::Serializable,
     types::{Message, inline::query::Article},
 };
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use rusqlite_migration::{M, Migrations};
 use serde::{Deserialize, Serialize};
 use tap::Pipe;
 
 #[derive(Debug)]
-pub struct Messages(Connection);
+pub struct Database(Connection);
 
-impl Messages {
+impl Database {
     #[inline]
     pub fn open(p: impl AsRef<Path>) -> Result<Self> {
         Connection::open(p)?.pipe(Self).pre_start()?.pipe(Ok)
@@ -26,14 +26,22 @@ impl Messages {
 
     #[inline]
     fn pre_start(mut self) -> Result<Self> {
-        let migrations = Migrations::new(vec![M::up(
-            "CREATE TABLE message  (
-                id           INTEGER PRIMARY KEY,
-                text         TEXT,
-                is_forwarded BOOLEAN,
-                raw          BLOB
-            )",
-        )]);
+        let migrations = Migrations::new(vec![
+            M::up(
+                "CREATE TABLE message (
+                    id           INTEGER PRIMARY KEY,
+                    text         TEXT,
+                    is_forwarded BOOLEAN,
+                    raw          BLOB
+                )",
+            ),
+            M::up(
+                "CREATE TABLE user (
+                    user_id      INTEGER PRIMARY KEY,
+                    count        INTEGER
+                )",
+            ),
+        ]);
 
         self.pragma_update(None, "journal_mode", "WAL")?;
         migrations.to_latest(&mut self)?;
@@ -101,13 +109,39 @@ impl Messages {
 
     pub fn existing_ids(&self) -> Result<BTreeSet<i32>> {
         self.prepare("SELECT id FROM message")?
-            .query_map([], |row| row.get::<_, i32>(0))?
+            .query_map([], |row| row.get(0))?
             .collect::<rusqlite::Result<BTreeSet<i32>>>()
             .wrap_err("Failed to collect existing ids")
     }
+
+    pub fn bump_user_count(&self, user_id: i64) -> Result<()> {
+        self.execute(
+            r"INSERT INTO user (user_id, count) VALUES (?1, 1)
+              ON CONFLICT(user_id) DO UPDATE SET count = count + 1",
+            (user_id,),
+        )
+        .wrap_err("Failed to bump user count")
+        .map(|_| ())
+    }
+
+    pub fn get_user_stats(&self, user_id: i64) -> Result<Option<UserStat>> {
+        self.prepare(
+            "SELECT count, count(*), COUNT(count <= u.count) FROM user u HAVINg user_id = ?1",
+        )?
+        .query_row((user_id,), |row| {
+            Ok(UserStat {
+                user_id,
+                count: row.get(0)?,
+                total_users: row.get(1)?,
+                lower_users: row.get(2)?,
+            })
+        })
+        .optional()
+        .wrap_err("Failed to get user stats")
+    }
 }
 
-impl Deref for Messages {
+impl Deref for Database {
     type Target = Connection;
 
     fn deref(&self) -> &Self::Target {
@@ -115,7 +149,7 @@ impl Deref for Messages {
     }
 }
 
-impl DerefMut for Messages {
+impl DerefMut for Database {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
@@ -135,12 +169,35 @@ pub struct SearchResult {
     pub text: String,
 }
 
+pub struct UserStat {
+    pub user_id: i64,
+    pub count: u32,
+    pub total_users: u32,
+    pub lower_users: u32,
+}
+
 impl From<SearchResult> for Article {
     fn from(x: SearchResult) -> Self {
         let msg = InputMessage::text(&x.text);
         Article::new(x.text, msg)
             .id(format!("{}", x.id))
             .description(format!("#{}", x.id))
+    }
+}
+
+impl From<UserStat> for Article {
+    fn from(x: UserStat) -> Self {
+        let msg = format!(
+            "我发了{}次 mk 语录，在模仿 mk 大赛中获得了第{}名的好成绩！",
+            x.count,
+            x.total_users - x.lower_users + 1,
+        );
+        let desc = format!(
+            "击败了 {}% 的群友",
+            (x.lower_users as f64 / x.total_users as f64) * 100.0
+        );
+
+        Article::new(msg.clone(), InputMessage::text(msg)).description(desc)
     }
 }
 

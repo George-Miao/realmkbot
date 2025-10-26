@@ -3,11 +3,11 @@
 #[macro_use]
 extern crate log;
 
-use std::{collections::BTreeSet, env, path::PathBuf, pin::pin, rc::Rc, sync::LazyLock};
+use std::{collections::BTreeSet, env, path::PathBuf, pin::pin};
 
 use color_eyre::{
     Result,
-    eyre::{Context, eyre},
+    eyre::{Context, ContextCompat, eyre},
 };
 use futures::{
     StreamExt,
@@ -25,7 +25,7 @@ use tap::Pipe;
 use tokio::{select, signal::ctrl_c};
 
 use crate::{
-    db::{MessageRecord, Messages},
+    db::{Database, MessageRecord},
     util::SkippingIter,
 };
 
@@ -52,8 +52,8 @@ async fn main() -> Result<()> {
 }
 
 struct App<C> {
-    config: &'static Config,
-    db: Rc<Messages>,
+    config: Config,
+    db: Database,
     client: Client,
     chat: C,
 }
@@ -65,24 +65,22 @@ const RECON: FixedReconnect = FixedReconnect {
 
 impl App<()> {
     async fn init() -> Result<Self> {
-        let config = Config::load();
+        let config = Config::load()?;
 
         info!("Starting up...");
         info!("Using config: {:?}", config);
 
         tokio::fs::create_dir_all(&config.data_dir).await?;
 
-        let db = Messages::open(config.data_dir.join("main.db"))?.pipe(Rc::new);
-
-        let app_config = Config::load();
+        let db = Database::open(config.data_dir.join("main.db"))?;
 
         let session = Session::load_file_or_create(config.data_dir.join("session"))
             .wrap_err("Failed to load session")?;
 
         let tg_config = grammers_client::Config {
             session,
-            api_hash: app_config.api_hash.clone(),
-            api_id: app_config.api_id,
+            api_hash: config.api_hash.clone(),
+            api_id: config.api_id,
             params: InitParams {
                 device_model: "Desktop".to_owned(),
                 system_version: "0.0".to_owned(),
@@ -98,7 +96,7 @@ impl App<()> {
         };
 
         let client = grammers_client::Client::connect(tg_config).await.unwrap();
-        client.bot_sign_in(&app_config.bot_token).await.unwrap();
+        client.bot_sign_in(&config.bot_token).await.unwrap();
         let me = client.get_me().await.unwrap().raw;
         info!("Logged in as: {:?}", me.username);
 
@@ -256,7 +254,23 @@ impl App<Chat> {
                 .map(Into::<Article>::into)
                 .map(Into::into);
 
-                query.answer(results).cache_time(0).send().await?;
+                let user_stat = self
+                    .db
+                    .get_user_stats(query.sender().id())?
+                    .into_iter()
+                    .map(Into::<Article>::into)
+                    .map(Into::into);
+
+                query
+                    .answer(user_stat.chain(results))
+                    .cache_time(0)
+                    .send()
+                    .await?;
+            }
+            Update::InlineSend(send) => {
+                let id = send.sender().id();
+                info!("Message sent by {id}");
+                self.db.bump_user_count(id)?;
             }
             Update::NewMessage(msg) => {
                 if msg.chat().id() != self.chat.id() {
@@ -327,31 +341,27 @@ fn default_data_dir() -> PathBuf {
 }
 
 impl Config {
-    pub fn load<'a>() -> &'a Self {
+    pub fn load() -> Result<Self> {
         use figment::{
             Figment,
             providers::{Env, Format, Json, Toml},
         };
 
-        static CONFIG: LazyLock<Config> = LazyLock::new(|| {
-            dotenvy::dotenv().ok();
-            let config_dir = dirs::config_dir()
-                .expect("Config dir cannot be found")
-                .join("realmkbot");
+        dotenvy::dotenv().ok();
+        let config_dir = dirs::config_dir()
+            .context("Config dir cannot be found")?
+            .join("realmkbot");
 
-            info!("Config dir: {}", config_dir.display());
+        info!("Config dir: {}", config_dir.display());
 
-            Figment::new()
-                .merge(Json::file(config_dir.join("config.json")))
-                .merge(Toml::file(config_dir.join("config.toml")))
-                .merge(Json::file("config.json"))
-                .merge(Toml::file("config.toml"))
-                .merge(Env::raw())
-                .extract()
-                .expect("Failed to load config")
-        });
-
-        &CONFIG
+        Figment::new()
+            .merge(Json::file(config_dir.join("config.json")))
+            .merge(Toml::file(config_dir.join("config.toml")))
+            .merge(Json::file("config.json"))
+            .merge(Toml::file("config.toml"))
+            .merge(Env::raw())
+            .extract()
+            .context("Failed to load config")
     }
 
     pub fn tdlib_dir(&self) -> PathBuf {
