@@ -27,18 +27,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install nix
-        uses: cachix/install-nix-action@v31
-        with:
-          nix_path: nixpkgs=channel:nixos-unstable
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
 
-      # Build the Docker image using Nix, results in a Docker image tarball
-      # The output path is recorded into a variable for later use
-      - name: Build image
-        id: build
-        run: |
-          IMAGE_PATH=$(nix build '.#docker' --print-out-paths --no-link)
-          echo "IMAGE_PATH=$IMAGE_PATH" >> $GITHUB_ENV
+      - name: Setup Nix Magic Cache
+        uses: DeterminateSystems/magic-nix-cache-action@main
 
       - name: Log in to the Container registry
         uses: docker/login-action@v2
@@ -47,30 +40,17 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # This step uses [docker/metadata-action](https://github.com/docker/metadata-action#about) to extract tags and labels that will be applied to the specified image. The `id` "meta" allows the output of this step to be referenced in a subsequent step. The `images` value provides the base name for the tags and labels.
-      - name: Extract metadata (tags, labels) for Docker
-        id: meta
-        uses: docker/metadata-action@v5
+      - name: Log in to the Container registry
+        uses: docker/login-action@v2
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=sha
-      - name: Install skopeo
-        uses: awalsh128/cache-apt-pkgs-action@latest
-        with:
-          packages: skopeo
-          version: ${{ steps.meta.outputs.tags }}
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Push Docker image
-        id: push
+      - name: Build and Push Docker image
         run: |
-          SRC=docker-archive:$IMAGE_PATH
-          DEST=docker://${{ steps.meta.outputs.tags }}
-          skopeo copy \
-            --src-no-creds \
-            --dest-creds='${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}' \
-            $SRC $DEST
-          skopeo copy \
-            --src-no-creds \
-            --dest-creds='${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}' \
-            $SRC docker://latest
+          nix build ".#docker"
+          SHA_SHORT=$(echo ${{ github.sha }} | cut -c1-7)
+          IMAGE="${{ env.REGISTRY }}/george-miao/realmkbot"
+          nix-shell -p skopeo --command "skopeo --insecure-policy copy docker-archive:$(readlink -f ./result) docker://$IMAGE:$SHA_SHORT --dest-compress-format zstd"
+          nix-shell -p skopeo --command "skopeo --insecure-policy copy docker-archive:$(readlink -f ./result) docker://$IMAGE:latest --dest-compress-format zstd"
