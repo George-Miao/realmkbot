@@ -61,7 +61,7 @@ impl Messages {
     pub fn search(&self, reg: &str, limit: u8) -> Result<Vec<SearchResult>> {
         self.prepare(
             "SELECT id, text FROM message WHERE text IS NOT NULL AND text LIKE ?1 AND \
-             is_forwarded = TRUE LIMIT ?2",
+             is_forwarded = TRUE ORDER BY RANDOM() LIMIT ?2",
         )?
         .query_map(params![format!("%{reg}%"), limit], |row| {
             SearchResult {
