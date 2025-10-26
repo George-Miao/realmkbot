@@ -25,7 +25,7 @@ use tap::Pipe;
 use tokio::{select, signal::ctrl_c};
 
 use crate::{
-    db::{Database, MessageRecord},
+    db::{Database, MessageRecord, USER_STATS_ID},
     util::SkippingIter,
 };
 
@@ -268,6 +268,9 @@ impl App<Chat> {
                     .await?;
             }
             Update::InlineSend(send) => {
+                if send.result_id() == USER_STATS_ID {
+                    return Ok(());
+                }
                 let id = send.sender().id();
                 info!("Message sent by {id}");
                 self.db.bump_user_count(id)?;

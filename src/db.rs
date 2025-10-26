@@ -15,6 +15,8 @@ use rusqlite_migration::{M, Migrations};
 use serde::{Deserialize, Serialize};
 use tap::Pipe;
 
+pub const USER_STATS_ID: &str = "stats";
+
 #[derive(Debug)]
 pub struct Database(Connection);
 
@@ -197,7 +199,9 @@ impl From<UserStat> for Article {
             (x.lower_users as f64 / x.total_users as f64) * 100.0
         );
 
-        Article::new(msg.clone(), InputMessage::text(msg)).description(desc)
+        Article::new(msg.clone(), InputMessage::text(msg))
+            .description(desc)
+            .id(USER_STATS_ID)
     }
 }
 
