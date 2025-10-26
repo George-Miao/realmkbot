@@ -1,16 +1,17 @@
 use std::{
+    collections::BTreeSet,
     ops::{Deref, DerefMut},
     path::Path,
 };
 
-use color_eyre::{eyre::Context, Result};
-use grammers_client::grammers_tl_types::Serializable;
+use color_eyre::{Result, eyre::Context};
 use grammers_client::{
-    types::{inline::query::Article, Message},
     InputMessage,
+    grammers_tl_types::Serializable,
+    types::{Message, inline::query::Article},
 };
-use rusqlite::{params, Connection};
-use rusqlite_migration::{Migrations, M};
+use rusqlite::{Connection, params};
+use rusqlite_migration::{M, Migrations};
 use serde::{Deserialize, Serialize};
 use tap::Pipe;
 
@@ -42,8 +43,8 @@ impl Messages {
 
     pub fn random(&self, limit: u8) -> Result<Vec<SearchResult>> {
         self.prepare(
-            "SELECT id, text FROM message WHERE is_forwarded = TRUE AND text IS NOT NULL \
-             ORDER BY RANDOM() LIMIT ?",
+            "SELECT id, text FROM message WHERE is_forwarded = TRUE AND text IS NOT NULL ORDER BY \
+             RANDOM() LIMIT ?",
         )?
         .query_map([limit], |row| {
             SearchResult {
@@ -74,7 +75,7 @@ impl Messages {
         .wrap_err("Failed to collect search result")
     }
 
-    pub fn insert_one(&self, msg: &MessageRecord) -> Result<()> {
+    pub fn upsert_one(&self, msg: &MessageRecord) -> Result<()> {
         self.execute(
             r"INSERT OR REPLACE INTO message (id, text, is_forwarded, raw) VALUES (?1, ?2, ?3, ?4)",
             (&msg.id, &msg.text, &msg.is_forwarded, &msg.raw),
@@ -98,13 +99,11 @@ impl Messages {
         Ok(num)
     }
 
-    pub fn exists(&self, id: i32) -> Result<bool> {
-        self.query_row(
-            "SELECT EXISTS(SELECT 1 FROM message WHERE id = ?1)",
-            [id],
-            |res| res.get(0),
-        )
-        .wrap_err("Failed to check if message exists")
+    pub fn existing_ids(&self) -> Result<BTreeSet<i32>> {
+        self.prepare("SELECT id FROM message")?
+            .query_map([], |row| row.get::<_, i32>(0))?
+            .collect::<rusqlite::Result<BTreeSet<i32>>>()
+            .wrap_err("Failed to collect existing ids")
     }
 }
 

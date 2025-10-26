@@ -3,7 +3,7 @@
 #[macro_use]
 extern crate log;
 
-use std::{env, path::PathBuf, pin::pin, rc::Rc, sync::LazyLock};
+use std::{collections::BTreeSet, env, path::PathBuf, pin::pin, rc::Rc, sync::LazyLock};
 
 use color_eyre::{
     Result,
@@ -15,7 +15,7 @@ use futures::{
     stream::FuturesUnordered,
 };
 use grammers_client::{
-    Client, FixedReconnect, InitParams, Update,
+    Client, FixedReconnect, InitParams, InvocationError, Update,
     session::Session,
     types::{Chat, inline::query::Article},
 };
@@ -24,9 +24,13 @@ use serde::Deserialize;
 use tap::Pipe;
 use tokio::{select, signal::ctrl_c};
 
-use crate::db::{MessageRecord, Messages};
+use crate::{
+    db::{MessageRecord, Messages},
+    util::SkippingIter,
+};
 
 mod db;
+mod util;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
@@ -54,6 +58,11 @@ struct App<C> {
     chat: C,
 }
 
+const RECON: FixedReconnect = FixedReconnect {
+    attempts: 5,
+    delay: std::time::Duration::from_secs(1),
+};
+
 impl App<()> {
     async fn init() -> Result<Self> {
         let config = Config::load();
@@ -64,10 +73,7 @@ impl App<()> {
         tokio::fs::create_dir_all(&config.data_dir).await?;
 
         let db = Messages::open(config.data_dir.join("main.db"))?.pipe(Rc::new);
-        const RECON: FixedReconnect = FixedReconnect {
-            attempts: 5,
-            delay: std::time::Duration::from_secs(1),
-        };
+
         let app_config = Config::load();
 
         let session = Session::load_file_or_create(config.data_dir.join("session"))
@@ -149,8 +155,6 @@ impl App<Chat> {
     }
 
     async fn populate(&self) -> Result<()> {
-        const STEP: i32 = 128;
-
         if self.config.skip_populate {
             info!("Skipped populating");
             return Ok(());
@@ -161,18 +165,37 @@ impl App<Chat> {
         let mut consecutive_empty_msg = 0;
         let mut added = 0;
 
-        'outter: for lower in (1..).step_by(STEP as _) {
-            let upper = lower + STEP - 1;
+        let existing_ids = if self.config.force_repopulate {
+            BTreeSet::new()
+        } else {
+            self.db.existing_ids()?
+        };
 
-            debug!("Getting {lower}..={upper}");
+        let mut iter = SkippingIter::new(&existing_ids);
 
-            let msg_ids = (lower..=upper).collect::<Vec<_>>();
-            let res = self
-                .client
-                .get_messages_by_id(&self.chat, msg_ids.as_slice())
-                .await?;
+        'outter: loop {
+            let msg_ids = (&mut iter).take(100).collect::<Vec<_>>();
+
+            let res = {
+                let res = self
+                    .client
+                    .get_messages_by_id(&self.chat, msg_ids.as_slice())
+                    .await;
+
+                match res {
+                    Err(InvocationError::Rpc(rpc)) if rpc.code == 420 => {
+                        let wait_time = rpc.value.unwrap_or(30);
+                        info!("Flood wait, waiting for {wait_time} seconds");
+                        tokio::time::sleep(std::time::Duration::from_secs(wait_time as _)).await;
+                        continue;
+                    }
+                    Err(e) => Err(e)?,
+                    Ok(res) => res,
+                }
+            };
 
             for msg in res {
+                // Assume there're no more messages after 10 consecutive empty messages
                 if consecutive_empty_msg > 10 {
                     break 'outter;
                 }
@@ -182,19 +205,17 @@ impl App<Chat> {
                     continue;
                 };
 
-                if self.db.exists(msg.id())? {
-                    consecutive_empty_msg = 0;
-                    continue;
-                }
+                let id = msg.id();
 
                 consecutive_empty_msg = 0;
-                MessageRecord::from_raw(msg).pipe(|msg| self.db.insert_one(&msg))?;
+
+                MessageRecord::from_raw(msg).pipe(|msg| self.db.upsert_one(&msg))?;
+
                 added += 1;
-                debug!("Added");
+                debug!("Added #{id}");
             }
 
-            info!("Added {added} message(s), wait for half minutes");
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            info!("Added {added} message(s)");
         }
 
         info!("Done, {added} message(s) added");
@@ -252,7 +273,7 @@ impl App<Chat> {
                 debug!("{msg:?}");
 
                 let msg = MessageRecord::from_raw(msg);
-                self.db.insert_one(&msg)?;
+                self.db.upsert_one(&msg)?;
             }
             u => {
                 debug!("{u:?}")
@@ -294,6 +315,9 @@ pub struct Config {
 
     #[serde(default)]
     pub skip_populate: bool,
+
+    #[serde(default)]
+    pub force_repopulate: bool,
 }
 
 fn default_data_dir() -> PathBuf {
@@ -315,7 +339,7 @@ impl Config {
                 .expect("Config dir cannot be found")
                 .join("realmkbot");
 
-            info!("Config dir: {}", config_dir.join("config.toml").display());
+            info!("Config dir: {}", config_dir.display());
 
             Figment::new()
                 .merge(Json::file(config_dir.join("config.json")))
