@@ -70,3 +70,7 @@ jobs:
             --src-no-creds \
             --dest-creds='${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}' \
             $SRC $DEST
+          skopeo copy \
+            --src-no-creds \
+            --dest-creds='${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}' \
+            $SRC docker://latest
