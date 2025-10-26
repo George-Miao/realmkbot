@@ -268,10 +268,11 @@ impl App<Chat> {
                     .await?;
             }
             Update::InlineSend(send) => {
+                let id = send.sender().id();
                 if send.result_id() == USER_STATS_ID {
+                    info!("{id} requested stats");
                     return Ok(());
                 }
-                let id = send.sender().id();
                 info!("Message sent by {id}");
                 self.db.bump_user_count(id)?;
             }
