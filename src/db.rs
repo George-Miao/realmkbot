@@ -128,7 +128,11 @@ impl Database {
 
     pub fn get_user_stats(&self, user_id: i64) -> Result<Option<UserStat>> {
         self.prepare(
-            "SELECT count, count(*), COUNT(count <= u.count) FROM user u HAVINg user_id = ?1",
+            "SELECT u.count,
+                (SELECT COUNT(*) FROM user),
+                (SELECT COUNT(*) FROM user WHERE count < u.count)
+             FROM user u
+             WHERE user_id = ?1",
         )?
         .query_row((user_id,), |row| {
             Ok(UserStat {
@@ -196,7 +200,7 @@ impl From<UserStat> for Article {
         );
         let desc = format!(
             "击败了 {}% 的群友",
-            (x.lower_users as f64 / x.total_users as f64) * 100.0
+            ((x.lower_users + 1) as f64 / x.total_users as f64) * 100.0
         );
 
         Article::new(msg.clone(), InputMessage::text(msg))

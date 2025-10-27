@@ -9,13 +9,9 @@ use color_eyre::{
     Result,
     eyre::{Context, ContextCompat, eyre},
 };
-use futures::{
-    StreamExt, TryFutureExt,
-    future::{Either, select},
-    stream::FuturesUnordered,
-};
+use futures::{StreamExt, TryFutureExt, stream::FuturesUnordered};
 use grammers_client::{
-    Client, FixedReconnect, InitParams, InvocationError, Update,
+    Client, FixedReconnect, InitParams, Update,
     client::bots::AuthorizationError,
     session::Session,
     types::{Chat, inline::query::Article},
@@ -126,27 +122,26 @@ impl App<Chat> {
         info!("Running");
 
         let mut pool = FuturesUnordered::new();
+        let mut ctrl_c_fut = pin!(ctrl_c());
 
         loop {
             select! {
                 update = invoke(|| self.client.next_update()) => {
-                    let update = update?;
-                    pool.push(self.handle_update(update));
+                    pool.push(async {
+                        let update = update.context("Failed to receive update")?;
+                        self.handle_update(update).await
+                    });
                 },
                 result = pool.next() => {
                     if let Some(Err(e)) = result {
                         warn!("Error handling update: {e:?}");
                     }
                 }
-                _ = ctrl_c() => {
-                    info!("CTRL-C received, shutting down");
-                    loop {
-                        match select(pool.next(), pin!(ctrl_c())).await {
-                            Either::Left(_) => {}
-                            Either::Right(_) => {
-                                info!("CTRL-C received again, shutting down immediately");
-                                break;
-                            }
+                _ = &mut ctrl_c_fut => {
+                    info!("CTRL-C received, cleaning up...");
+                    while let Some(result) = pool.next().await {
+                        if let Err(e) = result {
+                            warn!("Error handling update during shutdown: {e:?}");
                         }
                     }
                     break
