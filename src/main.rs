@@ -126,7 +126,7 @@ impl App<Chat> {
 
         loop {
             select! {
-                update = invoke(|| self.client.next_update()) => {
+                update = self.client.next_update() => {
                     pool.push(async {
                         let update = update.context("Failed to receive update")?;
                         self.handle_update(update).await

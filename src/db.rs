@@ -196,7 +196,7 @@ impl From<UserStat> for Article {
         let msg = format!(
             "我发了{}次 mk 语录，在模仿 mk 大赛中获得了第{}名的好成绩！",
             x.count,
-            x.total_users - x.lower_users + 1,
+            x.total_users - x.lower_users,
         );
         let desc = format!(
             "击败了 {}% 的群友",
