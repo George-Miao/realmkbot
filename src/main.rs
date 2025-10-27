@@ -10,12 +10,13 @@ use color_eyre::{
     eyre::{Context, ContextCompat, eyre},
 };
 use futures::{
-    StreamExt,
+    StreamExt, TryFutureExt,
     future::{Either, select},
     stream::FuturesUnordered,
 };
 use grammers_client::{
     Client, FixedReconnect, InitParams, InvocationError, Update,
+    client::bots::AuthorizationError,
     session::Session,
     types::{Chat, inline::query::Article},
 };
@@ -26,7 +27,7 @@ use tokio::{select, signal::ctrl_c};
 
 use crate::{
     db::{Database, MessageRecord, USER_STATS_ID},
-    util::SkippingIter,
+    util::{SkippingIter, invoke},
 };
 
 mod db;
@@ -96,9 +97,18 @@ impl App<()> {
         };
 
         let client = grammers_client::Client::connect(tg_config).await.unwrap();
-        client.bot_sign_in(&config.bot_token).await.unwrap();
-        let me = client.get_me().await.unwrap().raw;
-        info!("Logged in as: {:?}", me.username);
+        invoke(|| {
+            client.bot_sign_in(&config.bot_token).map_err(|e| match e {
+                AuthorizationError::Gen(e) => panic!("Authorization error: {:?}", e),
+                AuthorizationError::Invoke(e) => e,
+            })
+        })
+        .await
+        .expect("Failed to sign in bot");
+
+        let me = invoke(|| client.get_me()).await?;
+
+        info!("Logged in as: {:?}", me.username());
 
         let this = Self {
             config,
@@ -119,7 +129,7 @@ impl App<Chat> {
 
         loop {
             select! {
-                update = self.client.next_update() => {
+                update = invoke(|| self.client.next_update()) => {
                     let update = update?;
                     pool.push(self.handle_update(update));
                 },
@@ -174,23 +184,11 @@ impl App<Chat> {
         'outter: loop {
             let msg_ids = (&mut iter).take(100).collect::<Vec<_>>();
 
-            let res = {
-                let res = self
-                    .client
+            let res = invoke(|| {
+                self.client
                     .get_messages_by_id(&self.chat, msg_ids.as_slice())
-                    .await;
-
-                match res {
-                    Err(InvocationError::Rpc(rpc)) if rpc.code == 420 => {
-                        let wait_time = rpc.value.unwrap_or(30);
-                        info!("Flood wait, waiting for {wait_time} seconds");
-                        tokio::time::sleep(std::time::Duration::from_secs(wait_time as _)).await;
-                        continue;
-                    }
-                    Err(e) => Err(e)?,
-                    Ok(res) => res,
-                }
-            };
+            })
+            .await?;
 
             for msg in res {
                 // Assume there're no more messages after 10 consecutive empty messages
