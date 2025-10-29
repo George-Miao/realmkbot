@@ -6,6 +6,8 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+grammers-client = { version = "0.7.0", git = "https://github.com/Lonami/grammers" }
+grammers-mtsender = { version = "0.7.0", git = "https://github.com/Lonami/grammers" }
 color-eyre = { version = "0.6.5", default-features = false }
 tokio = { version = "1.48.0", features = ["fs", "macros", "rt", "signal"] }
 figment = { version = "0.10.19", features = ["env", "json", "toml"] }
@@ -21,4 +23,3 @@ pretty_env_logger = "0.5.0"
 serde_json = "1.0.145"
 rusqlite_migration = "2.3.0"
 redacted_debug = "0.2.0"
-grammers-client = "0.7.0"

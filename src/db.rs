@@ -8,7 +8,7 @@ use color_eyre::{Result, eyre::Context};
 use grammers_client::{
     InputMessage,
     grammers_tl_types::Serializable,
-    types::{Message, inline::query::Article},
+    types::{Message, update::Article},
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use rusqlite_migration::{M, Migrations};
@@ -184,7 +184,7 @@ pub struct UserStat {
 
 impl From<SearchResult> for Article {
     fn from(x: SearchResult) -> Self {
-        let msg = InputMessage::text(&x.text);
+        let msg = InputMessage::new().text(&x.text);
         Article::new(x.text, msg)
             .id(format!("{}", x.id))
             .description(format!("#{}", x.id))
@@ -203,14 +203,14 @@ impl From<UserStat> for Article {
             ((x.lower_users + 1) as f64 / x.total_users as f64) * 100.0
         );
 
-        Article::new(msg.clone(), InputMessage::text(msg))
+        Article::new(msg.clone(), InputMessage::new().text(msg))
             .description(desc)
             .id(USER_STATS_ID)
     }
 }
 
 impl MessageRecord {
-    pub fn from_raw(msg: Message) -> Self {
+    pub fn from_raw(msg: &Message) -> Self {
         let text = match msg.text() {
             "" => None,
             text => Some(text.to_string()),

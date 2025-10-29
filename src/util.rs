@@ -40,22 +40,3 @@ fn test_skipping_iter() {
     assert_eq!(iter.next(), Some(9));
     assert_eq!(iter.next(), Some(10));
 }
-
-pub async fn invoke<F, R>(mut f: F) -> Result<R, InvocationError>
-where
-    F: AsyncFnMut() -> Result<R, InvocationError>,
-{
-    loop {
-        let res = f().await;
-
-        match res {
-            Err(InvocationError::Rpc(rpc)) if rpc.code == 420 => {
-                let wait_time = rpc.value.unwrap_or(30);
-                info!("Flood wait, waiting for {wait_time} seconds");
-                tokio::time::sleep(std::time::Duration::from_secs(wait_time as _)).await;
-            }
-            Err(e) => return Err(e),
-            Ok(res) => return Ok(res),
-        }
-    }
-}

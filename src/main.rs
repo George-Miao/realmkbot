@@ -3,27 +3,29 @@
 #[macro_use]
 extern crate log;
 
-use std::{collections::BTreeSet, env, path::PathBuf, pin::pin};
+use std::{collections::BTreeSet, env, path::PathBuf, sync::Arc};
 
 use color_eyre::{
     Result,
     eyre::{Context, ContextCompat, eyre},
 };
-use futures::{StreamExt, TryFutureExt, stream::FuturesUnordered};
+use futures::TryFutureExt;
 use grammers_client::{
-    Client, FixedReconnect, InitParams, Update,
+    Client, ClientConfiguration, Update, UpdatesConfiguration,
     client::bots::AuthorizationError,
-    session::Session,
-    types::{Chat, inline::query::Article},
+    grammers_tl_types as tl,
+    session::{UpdatesLike, storages::TlSession},
+    types::{Peer, update::Article},
 };
+use grammers_mtsender::{ConnectionParams, SenderPool};
 use redacted_debug::RedactedDebug;
 use serde::Deserialize;
 use tap::Pipe;
-use tokio::{select, signal::ctrl_c};
+use tokio::{spawn, sync::mpsc::UnboundedReceiver, task::JoinSet};
 
 use crate::{
     db::{Database, MessageRecord, USER_STATS_ID},
-    util::{SkippingIter, invoke},
+    util::SkippingIter,
 };
 
 mod db;
@@ -34,7 +36,7 @@ async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
     color_eyre::install().unwrap();
     if env::var("RUST_LOG").is_err() {
-        env::set_var("RUST_LOG", "realmkbot=info");
+        env::set_var("RUST_LOG", "realmkbot=info,grammers_client=debug");
     }
     pretty_env_logger::init();
 
@@ -52,13 +54,9 @@ struct App<C> {
     config: Config,
     db: Database,
     client: Client,
+    updates: Option<UnboundedReceiver<UpdatesLike>>,
     chat: C,
 }
-
-const RECON: FixedReconnect = FixedReconnect {
-    attempts: 5,
-    delay: std::time::Duration::from_secs(1),
-};
 
 impl App<()> {
     async fn init() -> Result<Self> {
@@ -71,43 +69,41 @@ impl App<()> {
 
         let db = Database::open(config.data_dir.join("main.db"))?;
 
-        let session = Session::load_file_or_create(config.data_dir.join("session"))
-            .wrap_err("Failed to load session")?;
+        let session = TlSession::load_file_or_create(config.data_dir.join("session"))
+            .wrap_err("Failed to load session")?
+            .pipe(Arc::new);
 
-        let tg_config = grammers_client::Config {
-            session,
-            api_hash: config.api_hash.clone(),
-            api_id: config.api_id,
-            params: InitParams {
-                device_model: "Desktop".to_owned(),
-                system_version: "0.0".to_owned(),
-                app_version: concat!("realmkbot ", env!("CARGO_PKG_VERSION")).to_owned(),
-                system_lang_code: "en".to_owned(),
-                lang_code: "en".to_owned(),
-                catch_up: true,
-                server_addr: None,
+        let mut param = ConnectionParams::default();
+        param.device_model = "Desktop".to_owned();
+        param.system_version = "0.0".to_owned();
+        param.app_version = concat!("realmkbot ", env!("CARGO_PKG_VERSION")).to_owned();
+        param.system_lang_code = "en".to_owned();
+        param.lang_code = "en".to_owned();
+
+        let pool = SenderPool::with_configuration(session, config.api_id, param);
+        let client = grammers_client::Client::with_configuration(
+            &pool,
+            ClientConfiguration {
                 flood_sleep_threshold: 0,
-                update_queue_limit: None,
-                reconnection_policy: &RECON,
             },
-        };
+        );
 
-        let client = grammers_client::Client::connect(tg_config).await.unwrap();
-        invoke(|| {
-            client.bot_sign_in(&config.bot_token).map_err(|e| match e {
+        spawn(pool.runner.run());
+
+        let me = client
+            .bot_sign_in(&config.bot_token, &config.api_hash)
+            .map_err(|e| match e {
                 AuthorizationError::Gen(e) => panic!("Authorization error: {:?}", e),
                 AuthorizationError::Invoke(e) => e,
             })
-        })
-        .await
-        .expect("Failed to sign in bot");
-
-        let me = invoke(|| client.get_me()).await?;
+            .await
+            .expect("Failed to sign in bot");
 
         info!("Logged in as: {:?}", me.username());
 
         let this = Self {
             config,
+            updates: Some(pool.updates),
             db,
             client,
             chat: (),
@@ -117,34 +113,96 @@ impl App<()> {
     }
 }
 
-impl App<Chat> {
+impl App<Peer> {
     async fn run(&mut self) -> Result<()> {
-        info!("Running");
+        let updates = self.updates.take().expect("Cannot run the client twice");
 
-        let mut pool = FuturesUnordered::new();
-        let mut ctrl_c_fut = pin!(ctrl_c());
+        let config = UpdatesConfiguration {
+            catch_up: true,
+            update_queue_limit: Some(128),
+        };
+
+        let mut stream = self.client.stream_updates(updates, config);
 
         loop {
-            select! {
-                update = self.client.next_update() => {
-                    let update = update?;
-                    pool.push(self.handle_update(update));
-                },
-                result = pool.next() => {
-                    if let Some(Err(e)) = result {
-                        warn!("Error handling update: {e:?}");
-                    }
+            let update = stream.next().await?;
+            self.handle_update(update).await?;
+        }
+    }
+
+    async fn handle_update(&self, update: Update) -> Result<()> {
+        match update {
+            Update::InlineQuery(query) => {
+                info!("New query from {}", query.sender().bare_id());
+                debug!("{query:?}");
+
+                let results = if query.text().is_empty() {
+                    self.db.random(10)?
+                } else {
+                    self.db.search(query.text(), 10)?
                 }
-                _ = &mut ctrl_c_fut => {
-                    info!("CTRL-C received, cleaning up...");
-                    while let Some(result) = pool.next().await {
-                        if let Err(e) = result {
-                            warn!("Error handling update during shutdown: {e:?}");
-                        }
-                    }
-                    break
-                 }
-            };
+                .into_iter()
+                .map(Into::<Article>::into);
+
+                let user_stat = self
+                    .db
+                    .get_user_stats(query.sender().bare_id())?
+                    .into_iter()
+                    .map(Into::<Article>::into);
+
+                query
+                    .answer(user_stat.chain(results))
+                    .cache_time(0)
+                    .send()
+                    .await?;
+            }
+            Update::InlineSend(send) => {
+                let id = send.sender().bare_id();
+                if send.result_id() == USER_STATS_ID {
+                    info!("{id} requested stats");
+                    return Ok(());
+                }
+                info!("Message sent by {id}");
+                self.db.bump_user_count(id)?;
+            }
+            Update::NewMessage(msg) => {
+                if msg.chat_id() != self.chat.id() {
+                    debug!(
+                        "Unknown channel, skip ({} != {})",
+                        msg.chat_id(),
+                        self.chat.id()
+                    );
+
+                    return Result::<()>::Ok(());
+                }
+
+                info!("New message in channel");
+                debug!("{msg:?}");
+
+                let msg = MessageRecord::from_raw(&msg);
+                self.db.upsert_one(&msg)?;
+            }
+            Update::MessageDeleted(update) => {
+                if update.channel_id() != Some(self.chat.id().bare_id()) {
+                    debug!(
+                        "Unknown chat, skip ({:?} != {})",
+                        update.channel_id(),
+                        self.chat.id().bare_id()
+                    );
+
+                    return Result::<()>::Ok(());
+                }
+
+                info!("Message deleted in channel");
+                debug!("{update:?}");
+
+                self.db
+                    .delete(update.messages())?
+                    .pipe(|num| info!("{num} message(s) deleted"));
+            }
+            u => {
+                debug!("{u:?}")
+            }
         }
 
         Ok(())
@@ -177,11 +235,10 @@ impl App<Chat> {
         'outter: loop {
             let msg_ids = (&mut iter).take(100).collect::<Vec<_>>();
 
-            let res = invoke(|| {
-                self.client
-                    .get_messages_by_id(&self.chat, msg_ids.as_slice())
-            })
-            .await?;
+            let res = self
+                .client
+                .get_messages_by_id(&self.chat, msg_ids.as_slice())
+                .await?;
 
             for msg in res {
                 // Assume there're no more messages after 10 consecutive empty messages
@@ -193,12 +250,16 @@ impl App<Chat> {
                     consecutive_empty_msg += 1;
                     continue;
                 };
+                if matches!(msg.raw, tl::enums::Message::Empty(_)) {
+                    consecutive_empty_msg += 1;
+                    continue;
+                }
 
                 let id = msg.id();
 
                 consecutive_empty_msg = 0;
 
-                MessageRecord::from_raw(msg).pipe(|msg| self.db.upsert_one(&msg))?;
+                MessageRecord::from_raw(&msg).pipe(|msg| self.db.upsert_one(&msg))?;
 
                 added += 1;
                 debug!("Added #{id}");
@@ -211,89 +272,10 @@ impl App<Chat> {
 
         Ok(())
     }
-
-    async fn handle_update(&self, update: Update) -> Result<()> {
-        match update {
-            Update::MessageDeleted(update) => {
-                if update.channel_id() != Some(self.chat.id()) {
-                    debug!(
-                        "Unknown channel, skip ({:?} != {})",
-                        update.channel_id(),
-                        self.chat.id()
-                    );
-
-                    return Result::<()>::Ok(());
-                }
-
-                info!("Message deleted in channel");
-                debug!("{update:?}");
-
-                self.db
-                    .delete(update.messages())?
-                    .pipe(|num| info!("{num} message(s) deleted"));
-            }
-            Update::InlineQuery(query) => {
-                info!("New query from {}", query.sender().id());
-                debug!("{query:?}");
-
-                let results = if query.text().is_empty() {
-                    self.db.random(10)?
-                } else {
-                    self.db.search(query.text(), 10)?
-                }
-                .into_iter()
-                .map(Into::<Article>::into)
-                .map(Into::into);
-
-                let user_stat = self
-                    .db
-                    .get_user_stats(query.sender().id())?
-                    .into_iter()
-                    .map(Into::<Article>::into)
-                    .map(Into::into);
-
-                query
-                    .answer(user_stat.chain(results))
-                    .cache_time(0)
-                    .send()
-                    .await?;
-            }
-            Update::InlineSend(send) => {
-                let id = send.sender().id();
-                if send.result_id() == USER_STATS_ID {
-                    info!("{id} requested stats");
-                    return Ok(());
-                }
-                info!("Message sent by {id}");
-                self.db.bump_user_count(id)?;
-            }
-            Update::NewMessage(msg) => {
-                if msg.chat().id() != self.chat.id() {
-                    debug!(
-                        "Unknown channel, skip ({} != {})",
-                        msg.chat().id(),
-                        self.chat.id()
-                    );
-
-                    return Result::<()>::Ok(());
-                }
-
-                info!("New message in channel");
-                debug!("{msg:?}");
-
-                let msg = MessageRecord::from_raw(msg);
-                self.db.upsert_one(&msg)?;
-            }
-            u => {
-                debug!("{u:?}")
-            }
-        }
-        Ok(())
-    }
 }
 
 impl<C> App<C> {
-    async fn load_chat(self) -> Result<App<Chat>> {
+    async fn load_chat(self) -> Result<App<Peer>> {
         let chat = self
             .client
             .resolve_username(&self.config.chat_name)
@@ -302,6 +284,7 @@ impl<C> App<C> {
 
         Ok(App {
             chat,
+            updates: self.updates,
             config: self.config,
             db: self.db,
             client: self.client,
