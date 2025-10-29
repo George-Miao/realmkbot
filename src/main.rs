@@ -1,4 +1,9 @@
-#![feature(type_changing_struct_update, duration_constants)]
+#![feature(
+    type_changing_struct_update,
+    duration_constants,
+    const_index,
+    const_trait_impl
+)]
 
 #[macro_use]
 extern crate log;
@@ -21,7 +26,7 @@ use grammers_mtsender::{ConnectionParams, SenderPool};
 use redacted_debug::RedactedDebug;
 use serde::Deserialize;
 use tap::Pipe;
-use tokio::{spawn, sync::mpsc::UnboundedReceiver, task::JoinSet};
+use tokio::{spawn, sync::mpsc::UnboundedReceiver};
 
 use crate::{
     db::{Database, MessageRecord, USER_STATS_ID},
@@ -58,11 +63,13 @@ struct App<C> {
     chat: C,
 }
 
+const COMMIT: &str = &env!("VERGEN_GIT_SHA")[..6];
+
 impl App<()> {
     async fn init() -> Result<Self> {
         let config = Config::load()?;
 
-        info!("Starting up...");
+        info!("Starting up build #{COMMIT}...");
         info!("Using config: {:?}", config);
 
         tokio::fs::create_dir_all(&config.data_dir).await?;
@@ -84,7 +91,7 @@ impl App<()> {
         let client = grammers_client::Client::with_configuration(
             &pool,
             ClientConfiguration {
-                flood_sleep_threshold: 0,
+                flood_sleep_threshold: config.flood_sleep_threshold,
             },
         );
 
@@ -310,12 +317,19 @@ pub struct Config {
 
     #[serde(default)]
     pub force_repopulate: bool,
+
+    #[serde(default = "default_flood_sleep_threshold")]
+    pub flood_sleep_threshold: u32,
 }
 
 fn default_data_dir() -> PathBuf {
     dirs::data_dir()
         .expect("data dir cannot be found")
         .join("realmkbot")
+}
+
+fn default_flood_sleep_threshold() -> u32 {
+    300
 }
 
 impl Config {
