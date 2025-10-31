@@ -110,7 +110,7 @@ impl Database {
     }
 
     pub fn existing_ids(&self) -> Result<BTreeSet<i32>> {
-        self.prepare("SELECT id FROM message")?
+        self.prepare("SELECT id FROM message WHERE text IS NOT NULL")?
             .query_map([], |row| row.get(0))?
             .collect::<rusqlite::Result<BTreeSet<i32>>>()
             .wrap_err("Failed to collect existing ids")

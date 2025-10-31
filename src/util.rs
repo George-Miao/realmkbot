@@ -1,7 +1,5 @@
 use std::collections::BTreeSet;
 
-use grammers_client::InvocationError;
-
 pub struct SkippingIter<'a> {
     curr: i32,
     inner: &'a BTreeSet<i32>,
@@ -35,6 +33,20 @@ fn test_skipping_iter() {
 
     assert_eq!(iter.next(), Some(1));
     assert_eq!(iter.next(), Some(3));
+    assert_eq!(iter.next(), Some(6));
+    assert_eq!(iter.next(), Some(8));
+    assert_eq!(iter.next(), Some(9));
+    assert_eq!(iter.next(), Some(10));
+}
+
+#[test]
+fn test_skipping_iter_by_mut() {
+    let existing = BTreeSet::from([2, 4, 5, 7]);
+    let mut iter = SkippingIter::new(&existing);
+    let iter_mut = iter.by_ref();
+
+    assert_eq!(iter_mut.next(), Some(1));
+    assert_eq!(iter_mut.next(), Some(3));
     assert_eq!(iter.next(), Some(6));
     assert_eq!(iter.next(), Some(8));
     assert_eq!(iter.next(), Some(9));
