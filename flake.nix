@@ -1,6 +1,4 @@
 {
-  description = "Compio dev shell";
-
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     rust-overlay.url = "github:oxalica/rust-overlay";
@@ -9,16 +7,18 @@
     rust-overlay.inputs.nixpkgs.follows = "nixpkgs";
   };
 
-  outputs = {
-    nixpkgs,
-    rust-overlay,
-    flake-utils,
-    crane,
-    ...
-  }:
+  outputs =
+    {
+      nixpkgs,
+      rust-overlay,
+      flake-utils,
+      crane,
+      ...
+    }:
     flake-utils.lib.eachDefaultSystem (
-      system: let
-        overlays = [(import rust-overlay)];
+      system:
+      let
+        overlays = [ (import rust-overlay) ];
         pkgs = import nixpkgs {
           inherit system overlays;
         };
@@ -43,27 +43,29 @@
           created = "now";
           tag = "latest";
           config = {
-            Cmd = ["${realmkbot}/bin/realmkbot"];
+            Cmd = [ "${realmkbot}/bin/realmkbot" ];
           };
         };
       in
-        with pkgs; {
-          packages = {
-            inherit docker realmkbot;
-            default = realmkbot;
-          };
+      with pkgs;
+      {
+        packages = {
+          inherit docker realmkbot;
+          default = realmkbot;
+        };
 
-          apps.default = flake-utils.lib.mkApp {
-            drv = realmkbot;
-          };
+        apps.default = flake-utils.lib.mkApp {
+          drv = realmkbot;
+        };
 
-          devShells.default = mkShell {
-            buildInputs = with pkgs;
-              [
-                infisical
-              ]
-              ++ buildInputs;
-          };
-        }
+        devShells.default = mkShell {
+          buildInputs =
+            with pkgs;
+            [
+              infisical
+            ]
+            ++ buildInputs;
+        };
+      }
     );
 }
